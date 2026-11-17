@@ -24,7 +24,7 @@ The program is `target/release/revo2win`.
 ## Use
 
 ```
-revo2win to-win  <files or folders>... [-o <output>] [--game mysims|kingdom]
+revo2win to-win  <files, packages or folders>... [-o <output>] [--game mysims|kingdom]
 revo2win to-revo <files or folders>... [-o <output>] [--game mysims|kingdom|agents]
 revo2win info    <files>...
 ```
@@ -49,8 +49,20 @@ revo2win to-revo "0x00000000!0x00c9c8fd11211bae.0xb359c791" --game agents
 revo2win info "0x00000000!0x00c9c8fd11211bae.0xb359c791"
 ```
 
-The Wii games keep their models inside `.package` files; extract them first with a package tool
-such as MorcuTool.
+`to-win` also reads the Wii games' `.package` files directly, whether named or found in a
+folder. The models in a package go to a folder named after it, as if it had been extracted in
+place: `Characters/CAS-kInitial.package` gives `Characters/CAS-kInitial/` with one file per
+model, named by its key (`0x86769daf!0x0000000000000001.0xb359c791`). MySims gives every model
+in a package instance 1, so the group is what tells them apart. A model stored more than once
+in the same package is written once. Everything else in a package is left alone.
+
+```
+revo2win to-win "MySims Agents/DATA/files" -o PC/Agents
+revo2win to-win GameData/Characters/CAS-kInitial.package
+```
+
+Run on the PAL discs, this converts every model: 5,868 in MySims, 10,448 in Kingdom and 3,127
+in Agents.
 
 ## What converts, and what does not
 

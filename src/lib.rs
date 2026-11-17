@@ -13,6 +13,7 @@ pub mod detect;
 pub mod game;
 pub mod hash;
 pub mod model;
+pub mod package;
 pub mod rmdl;
 pub mod strip;
 pub mod wmdl;

@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 
 use revo2win::convert::{Format, Model, Options, Report, material_name_map};
 use revo2win::game::{Game, types};
+use revo2win::package::{self, Package};
 use revo2win::{RevoModel, WindowsModel, detect};
 
 /// Converts MySims models between the Wii's RevoModel and the PC's WindowsModel.
@@ -34,7 +35,7 @@ enum Command {
 
 #[derive(Args)]
 struct Convert {
-    /// Model files, or folders to search for them.
+    /// Model files, Wii .package files, or folders to search for either.
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 
@@ -155,14 +156,18 @@ fn convert(args: &Convert, to: Format) -> anyhow::Result<bool> {
     }
     let jobs = collect(&args.inputs)?;
     let single = jobs.len() == 1 && jobs[0].root.is_none();
-    let (mut done, mut failed, mut skipped) = (0, 0, 0);
+    let mut tally = Tally::default();
+    let from = match to {
+        Format::Windows => Format::Revo,
+        Format::Revo => Format::Windows,
+    };
 
     for job in &jobs {
         let data = std::fs::read(&job.path).with_context(|| format!("reading {}", job.path.display()))?;
-        let from = match to {
-            Format::Windows => Format::Revo,
-            Format::Revo => Format::Windows,
-        };
+        if to == Format::Windows && package::is_package(&data) {
+            convert_package(&data, job, args, names.as_deref(), &mut tally)?;
+            continue;
+        }
         let is_input = match from {
             Format::Revo => RevoModel::is_revo_model(&data),
             Format::Windows => WindowsModel::is_windows_model(&data),
@@ -170,48 +175,141 @@ fn convert(args: &Convert, to: Format) -> anyhow::Result<bool> {
         if !is_input {
             if job.root.is_none() {
                 eprintln!("{}: not a {}", job.path.display(), format_name(from));
-                failed += 1;
+                tally.failed += 1;
             } else {
-                skipped += 1;
+                tally.skipped += 1;
             }
             continue;
         }
+        convert_file(&data, job, single, to, args, names.as_deref(), &mut tally)?;
+    }
+    if jobs.len() > 1 || tally.packages > 0 {
+        println!("{} converted, {} failed, {} other files skipped", tally.done, tally.failed, tally.skipped);
+    }
+    Ok(tally.failed == 0)
+}
 
-        match convert_one(&data, &job.path, to, args, names.as_deref()) {
-            Ok((bytes, source, target, report)) => {
-                let out_path = destination(job, args.output.as_deref(), single, to, target);
-                if out_path == job.path {
-                    eprintln!("{}: the output would replace the input; skipped", job.path.display());
-                    failed += 1;
+#[derive(Default)]
+struct Tally {
+    done: usize,
+    failed: usize,
+    skipped: usize,
+    packages: usize,
+}
+
+/// Converts every RevoModel in a package. Each goes to a folder named after
+/// the package, as if the package had been extracted next to itself.
+fn convert_package(
+    data: &[u8],
+    job: &Job,
+    args: &Convert,
+    names: Option<&[String]>,
+    tally: &mut Tally,
+) -> anyhow::Result<()> {
+    tally.packages += 1;
+    let package = match Package::read(data) {
+        Ok(p) => p,
+        Err(e) => {
+            if job.root.is_some() {
+                eprintln!("{}: skipped, not a readable package ({e})", job.path.display());
+                tally.skipped += 1;
+            } else {
+                eprintln!("{}: {e}", job.path.display());
+                tally.failed += 1;
+            }
+            return Ok(());
+        }
+    };
+    let stem = job.path.file_stem().unwrap_or_default();
+    let folder = job.path.with_file_name(stem);
+    // A package given by itself is mirrored as its own folder under -o.
+    let root = job.root.clone().or_else(|| job.path.parent().map(Path::to_path_buf));
+    let mut models = package
+        .entries
+        .iter()
+        .filter(|e| matches!(e.key.type_id, types::REVO_MODEL | types::REVO_MODEL_AGENTS))
+        .peekable();
+    if models.peek().is_none() {
+        if job.root.is_none() {
+            eprintln!("{}: no models in this package", job.path.display());
+        }
+        tally.skipped += 1;
+        return Ok(());
+    }
+    // MySims's CAS packages hold some models many times over, byte for byte.
+    let mut seen = std::collections::HashMap::new();
+    for entry in models {
+        let path = folder.join(entry.key.to_string());
+        let model = Job { path, root: root.clone() };
+        let extracted = package.extract(entry);
+        if let Ok(bytes) = &extracted {
+            match seen.get(&entry.key) {
+                Some(first) if first == bytes => continue,
+                Some(_) => {
+                    eprintln!("{}: in the package twice, with different contents", model.path.display());
+                    tally.failed += 1;
                     continue;
                 }
-                if out_path.exists() && !args.force {
-                    eprintln!("{}: exists (use --force to overwrite)", out_path.display());
-                    failed += 1;
-                    continue;
+                None => {
+                    seen.insert(entry.key, bytes.clone());
                 }
-                if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("creating {}", parent.display()))?;
-                }
-                std::fs::write(&out_path, bytes)
-                    .with_context(|| format!("writing {}", out_path.display()))?;
-                println!("{} ({source}) -> {} ({target})", job.path.display(), out_path.display());
-                for note in report.notes {
-                    println!("  note: {note}");
-                }
-                done += 1;
+            }
+        }
+        match extracted {
+            Ok(bytes) if RevoModel::is_revo_model(&bytes) => {
+                convert_file(&bytes, &model, false, Format::Windows, args, names, tally)?;
+            }
+            Ok(_) => {
+                eprintln!("{}: not a RevoModel", model.path.display());
+                tally.failed += 1;
             }
             Err(e) => {
-                eprintln!("{}: {e:#}", job.path.display());
-                failed += 1;
+                eprintln!("{}: {e}", model.path.display());
+                tally.failed += 1;
             }
         }
     }
-    if jobs.len() > 1 {
-        println!("{done} converted, {failed} failed, {skipped} other files skipped");
+    Ok(())
+}
+
+fn convert_file(
+    data: &[u8],
+    job: &Job,
+    single: bool,
+    to: Format,
+    args: &Convert,
+    names: Option<&[String]>,
+    tally: &mut Tally,
+) -> anyhow::Result<()> {
+    match convert_one(data, &job.path, to, args, names) {
+        Ok((bytes, source, target, report)) => {
+            let out_path = destination(job, args.output.as_deref(), single, to, target);
+            if out_path == job.path {
+                eprintln!("{}: the output would replace the input; skipped", job.path.display());
+                tally.failed += 1;
+                return Ok(());
+            }
+            if out_path.exists() && !args.force {
+                eprintln!("{}: exists (use --force to overwrite)", out_path.display());
+                tally.failed += 1;
+                return Ok(());
+            }
+            if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(&out_path, bytes).with_context(|| format!("writing {}", out_path.display()))?;
+            println!("{} ({source}) -> {} ({target})", job.path.display(), out_path.display());
+            for note in report.notes {
+                println!("  note: {note}");
+            }
+            tally.done += 1;
+        }
+        Err(e) => {
+            eprintln!("{}: {e:#}", job.path.display());
+            tally.failed += 1;
+        }
     }
-    Ok(failed == 0)
+    Ok(())
 }
 
 fn destination(job: &Job, output: Option<&Path>, single: bool, to: Format, target: Game) -> PathBuf {
