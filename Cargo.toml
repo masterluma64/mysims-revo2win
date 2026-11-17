@@ -1,0 +1,27 @@
+[package]
+name = "revo2win"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Converts MySims models between the Wii RevoModel and the PC WindowsModel formats"
+license = "GPL-3.0-only"
+keywords = ["mysims", "wii", "model", "converter"]
+categories = ["command-line-utilities", "game-development"]
+
+[[bin]]
+name = "revo2win"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
